@@ -20,9 +20,9 @@ static void _spi_ensure()
     cfg.sclk_io_num     = ICM42688_SCLK;
     cfg.quadwp_io_num   = -1;
     cfg.quadhd_io_num   = -1;
-    cfg.max_transfer_sz = 64;
+    cfg.max_transfer_sz = 4096;          /* 支持 DMA 大批量传输 */
 
-    spi_bus_initialize(ICM42688_SPI_HOST, &cfg, SPI_DMA_DISABLED);
+    spi_bus_initialize(ICM42688_SPI_HOST, &cfg, SPI_DMA_CH_AUTO);
     _spi_bus_ready = true;
 
     ESP_LOGI("SPI", "总线初始化 (SCLK=%d MOSI=%d MISO=%d CS=%d)",

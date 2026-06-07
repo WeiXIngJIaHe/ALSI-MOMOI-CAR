@@ -23,6 +23,7 @@
 #include "URAT.h"
 #include "wifi.h"
 #include "mqtt.h"
+#include "wifi_remote.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -40,6 +41,8 @@ ICM42688   g_imu;
 URAT       g_uart(UART_NUM_1, URAT_TX_PIN, URAT_RX_PIN, URAT_BAUDRATE);
 WiFi       g_wifi(WIFI_SSID, WIFI_PASS);
 MQTT       g_mqtt(MQTT_BROKER_URI);
+MotorDriver g_motor;
+WiFiRemote  g_wifi_remote(g_motor);
 
 /* ---- 队列 ---- */
 struct Msg {
@@ -65,6 +68,9 @@ static void hw_init()
     g_led.init();
     g_btn.init();
 
+    /* 电机驱动 (PWM) */
+    g_motor.init();
+
     /* IMU */
     if (!g_imu.begin()) { ESP_LOGE(TAG, "IMU 初始化失败"); }
     g_imu.configINT1(false, false, false);  /* 推挽/低有效/脉冲 */
@@ -79,6 +85,9 @@ static void hw_init()
     g_mqtt.init();
     g_mqtt.subscribe("/car/cmd");
     g_mqtt.subscribe("/car/led");
+
+    /* WiFi 遥控 (TCP Server) */
+    g_wifi_remote.init();
 
     /* 陀螺仪零偏校准 (需静止) */
     g_imu.calibrate(200);
@@ -113,7 +122,13 @@ static void core1_ctrl(void *pv)
     Msg msg;
     int  tick = 0;
 
-    PID pid_speed(1.0f, 0.1f, 0.05f, 5.0f, -100, 100);
+    /* PID: 姿态角速度控制 → 电机差速 */
+    PID pid_balance(0.8f, 0.05f, 0.03f, 5.0f, -1023, 1023);  /* 输出→电机占空比 */
+    PID pid_turn(0.5f, 0.02f, 0.01f, 5.0f, -512, 512);
+
+    /* 目标: 保持静止 (角速度=0, 方向=0) */
+    float target_gyro_z = 0.0f;    /* 目标偏航角速度 */
+    float target_turn   = 0.0f;
 
     TickType_t xl = xTaskGetTickCount();
     ESP_LOGI(TAG, "Core1 OK");
@@ -126,9 +141,14 @@ static void core1_ctrl(void *pv)
             if (msg.type == Msg::IMU) { latest = msg.imu; has_new = true; }
         }
 
-        /* ── PID ── */
+        /* ── PID → 电机 ── */
         if (has_new) {
-            /* float out = pid_speed.update(target, latest.gx); */
+            /* 姿态平衡 PID: 角速度误差 → 线速度修正 */
+            float balance_out = pid_balance.update(target_gyro_z, latest.gz);
+            float turn_out    = pid_turn.update(target_turn, latest.gz);
+
+            /* 驱动电机 (差分: speed±turn) */
+            g_motor.drive((int16_t)balance_out, (int16_t)turn_out);
         }
 
         /* ── 按键 ── */
@@ -140,11 +160,12 @@ static void core1_ctrl(void *pv)
             /* TODO: 按键处理 */
         }
 
+        /* ── WiFi 遥控 (TCP Server, 非阻塞) ── */
+        g_wifi_remote.process();
+
         /* ── MQTT 接收 ── */
         MQTT::Msg mq;
         while (g_mqtt.receive(mq)) {
-            msg.type = Msg::UART;   /* 复用 UART 通道 */
-            /* TODO: 根据 mq.topic / mq.data 分发处理 */
             if (strstr(mq.topic, "/car/cmd")) {
                 g_mqtt.publish("/car/ack", "ok");
             }
