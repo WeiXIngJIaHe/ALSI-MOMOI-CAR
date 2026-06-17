@@ -1,124 +1,159 @@
+/* ================================================================
+ * LSM6DSV16X — 完整 SPI 驱动 (ESP-IDF 5.5 / C++)
+ *
+ * 功能:
+ *   1. 原始 6 轴传感器数据 + 温度  (100Hz ~ 7680Hz)
+ *   2. SFLP 内置 6 轴融合 → Game Rotation Vector (四元数)
+ *   3. 陀螺仪零偏自动校准
+ *   4. FIFO 流模式读取
+ *
+ * SPI 协议:
+ *   命令字节 = (reg<<1) | R/W   (bit0=1 读, bit0=0 写)
+ *   Mode 0 (CPOL=0, CPHA=0) — ST 传感器默认
+ *   IF_INC=1 支持多字节连续读取 (地址自增)
+ *
+ * DMA:
+ *   总线初始化时 SPI_DMA_CH_AUTO 启用 DMA
+ *   读缓冲: DRAM_ATTR 静态对齐, 长度补齐 4B 倍数
+ *   写操作: 4B TXDATA/RXDATA 内联 (无需 DMA 缓冲)
+ * ================================================================ */
+
 #include "IMU.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "driver/gpio.h"
 #include <cstring>
 #include <cmath>
 
-static const char *TAG = "QMI8658";
+static const char *TAG = "LSM6DSV16X";
 
-static bool              _spi_ready = false;
-static SemaphoreHandle_t _spi_mutex = nullptr;   /* SPI 总线互斥锁 */
+/* ── 前置声明 ── */
+static float _halfToFloat(uint16_t h);
+
+/* ── DMA 安全缓冲池 (DRAM + 4B 对齐)
+ *    ESP-IDF DMA 要求: 内存在 DRAM 中, 32bit 对齐, 长度为 4B 倍数
+ *    使用 DRAM_ATTR 确保在内部 SRAM (MALLOC_CAP_DMA)
+ *    栈分配不可靠 (可能不在 DMA 区域), 用静态缓冲避免驱动内部 memcpy ── */
+#define DMA_POOL_SIZE  20   /* 最大 16B 数据 + 1B 命令 = 17, 补齐到 20 (5×4) */
+
+static DRAM_ATTR uint8_t __attribute__((aligned(4))) _dma_tx[DMA_POOL_SIZE];
+static DRAM_ATTR uint8_t __attribute__((aligned(4))) _dma_rx[DMA_POOL_SIZE];
+
+/* 互斥锁 — SPI 设备被 Core0(传感器) 和 Core1(UART命令) 共用 */
+static portMUX_TYPE _spi_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static inline void _spi_lock_acquire() {
+    portENTER_CRITICAL(&_spi_lock);
+}
+static inline void _spi_lock_release() {
+    portEXIT_CRITICAL(&_spi_lock);
+}
+
+/* ── 静态: 总线只初始化一次 ── */
+static bool _spi_ready = false;
 
 static void _spi_ensure()
 {
     if (_spi_ready) return;
     spi_bus_config_t cfg = {};
-    cfg.mosi_io_num     = QMI8658_MOSI;
-    cfg.miso_io_num     = QMI8658_MISO;
-    cfg.sclk_io_num     = QMI8658_SCLK;
+    cfg.mosi_io_num     = IMU_MOSI;
+    cfg.miso_io_num     = IMU_MISO;
+    cfg.sclk_io_num     = IMU_SCLK;
     cfg.quadwp_io_num   = -1;
     cfg.quadhd_io_num   = -1;
     cfg.max_transfer_sz = 4096;
-    spi_bus_initialize(QMI8658_SPI_HOST, &cfg, SPI_DMA_CH_AUTO);
+    cfg.flags           = 0;  /* 主模式, 无特殊标志 */
+    spi_bus_initialize(IMU_SPI_HOST, &cfg, SPI_DMA_CH_AUTO);
     _spi_ready = true;
-    ESP_LOGI(TAG, "SPI 总线 (SCLK=%d MOSI=%d MISO=%d CS=%d) — 软件控 CS",
-             QMI8658_SCLK, QMI8658_MOSI, QMI8658_MISO, QMI8658_CS);
+    ESP_LOGI(TAG, "SPI总线: SCLK=%d MOSI=%d MISO=%d CS=%d CLK=%dHz",
+             IMU_SCLK, IMU_MOSI, IMU_MISO, IMU_CS, (int)IMU_SPI_CLK_HZ);
 }
 
-/* ---- 软件 CS 宏 ---- */
-#define CS_LOW()   gpio_set_level((gpio_num_t)QMI8658_CS, 0)
-#define CS_HIGH()  gpio_set_level((gpio_num_t)QMI8658_CS, 1)
+/* ================================================================
+ * 构造 / 析构
+ * ================================================================ */
 
-/* ================================================================ */
-
-QMI8658::QMI8658()
-    : _spi(nullptr), _accel_lsb(9.80665f / QMI8658_ACC_LSB_2G),
-      _gyro_lsb(1.0f / QMI8658_GYRO_LSB_2048DPS),
+LSM6DSV16X::LSM6DSV16X()
+    : _spi(nullptr),
+      _accel_lsb(LSM_ACCEL_LSB_2G * 0.001f * 9.80665f),  /* mg→m/s² */
+      _gyro_lsb(LSM_GYRO_LSB_2000DPS * 0.001f),          /* mdps→dps */
       _gbx(0), _gby(0), _gbz(0)
 {}
 
-QMI8658::~QMI8658()
+LSM6DSV16X::~LSM6DSV16X()
 {
     if (_spi) spi_bus_remove_device(_spi);
 }
 
-/* ================================================================ */
+/* ================================================================
+ * begin() — 复位 + WHO_AM_I 校验 + 基础配置
+ * ================================================================ */
 
-bool QMI8658::begin()
+bool LSM6DSV16X::begin()
 {
-    
     _spi_ensure();
-    vTaskDelay(pdMS_TO_TICKS(200));
-    spi_device_interface_config_t dev_cfg = {};
-    dev_cfg.mode             = 0;    /* Mode 0: CS=0, SPC=1, Mode 3:CS=0,SPC=1 */
-    dev_cfg.clock_speed_hz   = QMI8658_SPI_CLK_HZ;
-    dev_cfg.spics_io_num     = QMI8658_CS;    /* 硬件 CS 精准时序 */
-    dev_cfg.queue_size       = 10;
-    dev_cfg.cs_ena_pretrans  = 1;             /* CS 提前 2 周期 */
-    dev_cfg.cs_ena_posttrans = 1;             /* CS 延后 8 周期 (锁存写数据) */
-    dev_cfg.input_delay_ns   = 10;
 
-    if (spi_bus_add_device(QMI8658_SPI_HOST, &dev_cfg, &_spi) != ESP_OK)
+    spi_device_interface_config_t dev_cfg = {};
+    dev_cfg.mode             = 0;              /* CPOL=0, CPHA=0 */
+    dev_cfg.clock_speed_hz   = IMU_SPI_CLK_HZ;
+    dev_cfg.spics_io_num     = IMU_CS;
+    dev_cfg.queue_size       = 1;
+    dev_cfg.cs_ena_pretrans  = 2;             /* CS 提前 2 个 SPI 位 */
+    dev_cfg.cs_ena_posttrans = 1;             /* CS 保持 1 个 SPI 位 */
+
+    if (spi_bus_add_device(IMU_SPI_HOST, &dev_cfg, &_spi) != ESP_OK)
         return false;
 
-    /* SPI 互斥锁 (防双核并发访问) */
-    if (!_spi_mutex) {
-        _spi_mutex = xSemaphoreCreateMutex();
-    }
+    /* ── 软件复位 ── */
+    writeReg(LSM_CTRL3, LSM_CTRL3_SW_RESET);
+    vTaskDelay(pdMS_TO_TICKS(20));
 
-    /* 1. 验证身份 */
-    /* SPI 帧诊断 */
-    ESP_LOGI(TAG, "-- SPI 帧诊断 (reg 0x00, 软件CS) --");
-    for (int bits = 8; bits <= 32; bits += 8) {
-        spi_transaction_t t = {};
-        t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-        t.length = bits;
-        t.tx_data[0] = (0x00 | 0x80);  // 第一字节: 读 WHO_AM_I
-        t.tx_data[1] = 0x00;           // 第二字节: dummy
-        spi_device_transmit(_spi, &t);
-        ESP_LOGI(TAG, "  %d-bit: rx[0]=0x%02X [1]=0x%02X [2]=0x%02X [3]=0x%02X",
-                 bits, t.rx_data[0], t.rx_data[1], t.rx_data[2], t.rx_data[3]);
-    }
-
+    /* ── WHO_AM_I 校验 ── */
     uint8_t id = whoAmI();
-    ESP_LOGI(TAG, "WHO_AM_I=0x%02X %s", id,
-             (id == QMI8658_WHO_AM_I_VAL) ? "✓" : "✗");
+    ESP_LOGI(TAG, "WHO_AM_I=0x%02X %s", id, (id == LSM_WHO_AM_I_VAL) ? "OK" : "?");
 
-    /* 2. 软件复位: CTRL1[0]=1 */
-    writeReg(QMI8658_REG_CTRL1, QMI8658_CTRL1_SRST);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    /* ── 基础配置 ── */
+    /* CTRL3: 使能 BDU (Block Data Update) + IF_INC (地址自增) */
+    writeReg(LSM_CTRL3, LSM_CTRL3_BDU | LSM_CTRL3_IF_INC);
 
-    /* 3. CTRL1: 地址自增[6]=1, 4线SPI[7]=0 → 0x40 */
-    writeReg(QMI8658_REG_CTRL1, 0x40);
+    /* CTRL1: 加速度计 120Hz 高性能模式 */
+    writeReg(LSM_CTRL1, LSM_ODR_XL_120HZ);
 
-    /* 4. CTRL2: ACC ±2G @ 100Hz → 0x04 */
-    /*    CTRL3: GYRO ±2048dps @ 100Hz → 0x64 */
-    writeReg(QMI8658_REG_CTRL2,  0x04);
-    writeReg(QMI8658_REG_CTRL3,  0x64);
+    /* CTRL2: 陀螺仪 120Hz 高性能模式 */
+    writeReg(LSM_CTRL2, LSM_ODR_G_120HZ);
 
-    /* 5. CTRL7: 使能 ACC + GYRO (低噪声模式) */
-    writeReg(QMI8658_REG_CTRL7,0x03);
+    /* CTRL6: 陀螺仪 ±2000dps */
+    writeReg(LSM_CTRL6, LSM_FS_G_2000DPS);
 
-    /* 6. 更新 LSB 比例系数 */
+    /* CTRL8: 加速度计 ±2g */
+    writeReg(LSM_CTRL8, LSM_FS_XL_2G);
+
     _applyScale();
+    ESP_LOGI(TAG, "初始化完成: ACC=±2g GYRO=±2000dps ODR=120Hz");
 
-    ESP_LOGI(TAG, "QMI8658 初始化完成 ");
     return true;
 }
 
-uint8_t QMI8658::whoAmI()
+uint8_t LSM6DSV16X::whoAmI()
 {
     uint8_t val = 0;
-    readReg(QMI8658_REG_WHO_AM_I, val);
+    readReg(LSM_WHO_AM_I, val);
     return val;
 }
 
-/* ================================================================ */
+bool LSM6DSV16X::reset()
+{
+    writeReg(LSM_CTRL3, LSM_CTRL3_SW_RESET);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return true;
+}
 
-QMI8658::Data3F QMI8658::readAll()
+/* ================================================================
+ * 原始传感器读取
+ * ================================================================ */
+
+LSM6DSV16X::Data3F LSM6DSV16X::readAll()
 {
     DataRaw r = readRaw();
     Data3F  d;
@@ -128,43 +163,49 @@ QMI8658::Data3F QMI8658::readAll()
     d.gx   = (float)r.gx * _gyro_lsb - _gbx;
     d.gy   = (float)r.gy * _gyro_lsb - _gby;
     d.gz   = (float)r.gz * _gyro_lsb - _gbz;
-    d.temp = (float)r.temp / QMI8658_TEMP_LSB + QMI8658_TEMP_OFFSET;
+    d.temp = (float)r.temp / LSM_TEMP_LSB + LSM_TEMP_OFFSET;
     return d;
 }
 
-QMI8658::DataRaw QMI8658::readRaw()
+LSM6DSV16X::DataRaw LSM6DSV16X::readRaw()
 {
     DataRaw raw = {};
-    uint8_t buf[14] = {0};
 
-    if (!readRegs(QMI8658_REG_TEMP_L, buf, 14)) {
-        ESP_LOGE(TAG, "SPI 连续读取失败!");
-        return raw;
-    }
+    /* ── DMA 突发: 单次 14 字节 (TEMP 0x20 → ACCEL_Z 0x2D)
+     *     readRegs 内部使用 DRAM_ATTR 对齐缓冲, 自动补齐 4B ── */
+    uint8_t buf[14];
+    if (!readRegs(LSM_OUT_TEMP_L, buf, 14)) return raw;
 
-    raw.temp = (int16_t)((buf[1]  << 8) | buf[0]);
-    raw.ax   = (int16_t)((buf[3]  << 8) | buf[2]);
-    raw.ay   = (int16_t)((buf[5]  << 8) | buf[4]);
-    raw.az   = (int16_t)((buf[7]  << 8) | buf[6]);
-    raw.gx   = (int16_t)((buf[9]  << 8) | buf[8]);
-    raw.gy   = (int16_t)((buf[11] << 8) | buf[10]);
-    raw.gz   = (int16_t)((buf[13] << 8) | buf[12]);
+    /* 小端解析 */
+    raw.temp = (int16_t)((buf[1]  << 8) | buf[0]);       /* 0x20-0x21 */
+    raw.gx   = (int16_t)((buf[3]  << 8) | buf[2]);       /* 0x22-0x23 */
+    raw.gy   = (int16_t)((buf[5]  << 8) | buf[4]);       /* 0x24-0x25 */
+    raw.gz   = (int16_t)((buf[7]  << 8) | buf[6]);       /* 0x26-0x27 */
+    raw.ax   = (int16_t)((buf[9]  << 8) | buf[8]);       /* 0x28-0x29 */
+    raw.ay   = (int16_t)((buf[11] << 8) | buf[10]);      /* 0x2A-0x2B */
+    raw.az   = (int16_t)((buf[13] << 8) | buf[12]);      /* 0x2C-0x2D */
 
     return raw;
 }
 
-float QMI8658::readTemp()
+float LSM6DSV16X::readTemp()
 {
     uint8_t buf[2];
-    if (!readRegs(QMI8658_REG_TEMP_L, buf, 2)) return 0;
-    return (float)(int16_t)((buf[0] << 8) | buf[1]) / QMI8658_TEMP_LSB
-           + QMI8658_TEMP_OFFSET;
+    if (!readRegs(LSM_OUT_TEMP_L, buf, 2)) return 0;
+    return (float)(int16_t)((buf[1] << 8) | buf[0]) / LSM_TEMP_LSB
+           + LSM_TEMP_OFFSET;
 }
 
-void QMI8658::calibrate(uint16_t samples)
+/* ================================================================
+ * 陀螺仪零偏校准
+ * ================================================================ */
+
+void LSM6DSV16X::calibrate(uint16_t samples)
 {
     double sx = 0, sy = 0, sz = 0;
-    ESP_LOGI(TAG, "陀螺仪校准 (%d 采样)...", samples);
+    ESP_LOGI(TAG, "陀螺仪校准 %d 采样...", samples);
+
+    /* 先丢弃前 10 个样本让传感器稳定 */
     for (int i = 0; i < 10; i++) { readRaw(); vTaskDelay(pdMS_TO_TICKS(10)); }
 
     for (uint16_t i = 0; i < samples; i++) {
@@ -174,135 +215,278 @@ void QMI8658::calibrate(uint16_t samples)
         sz += r.gz * _gyro_lsb;
         vTaskDelay(pdMS_TO_TICKS(2));
     }
+
     _gbx = (float)(sx / samples);
     _gby = (float)(sy / samples);
     _gbz = (float)(sz / samples);
-    ESP_LOGI(TAG, "校准完成: (%.4f, %.4f, %.4f) dps", _gbx, _gby, _gbz);
+    ESP_LOGI(TAG, "校准完成 bias=(%.4f, %.4f, %.4f) dps", _gbx, _gby, _gbz);
 }
 
-/* ================================================================ */
-/* SPI 读写 — 软件 CS 强控 + CPHA=1 错峰采样                         */
-/* ================================================================ */
+/* ================================================================
+ * SFLP — 内置 6 轴姿态融合 (Game Rotation Vector)
+ *
+ * 输出: 四元数 (X,Y,Z,W) @ 15~480Hz
+ *
+ * 配置步骤:
+ *   1. FUNC_CFG_ACCESS bit7=1  (解锁嵌入式寄存器)
+ *   2. 设置 SFLP ODR (≤ 传感器 ODR)
+ *   3. EMB_FUNC_FIFO_EN_A bit1=1 (四元数进 FIFO)
+ *   4. FIFO_CTRL4 设为流模式
+ *   5. EMB_FUNC_EN_A bit1=1 (启动 SFLP)
+ * ================================================================ */
 
-bool QMI8658::writeReg(uint8_t reg, uint8_t val)
+bool LSM6DSV16X::sflpBegin(uint8_t odr)
 {
-    /* tx_data[0] 先发 (低字节优先, ESP-IDF 文档明确) */
-    spi_transaction_t t = {};
-    t.flags      = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-    t.length     = 16;
-    t.tx_data[0] = (uint8_t)(reg & 0x7F);   // 第一字节: 地址 + 写标志
-    t.tx_data[1] = val;                      // 第二字节: 数据
-    t.tx_data[2] = 0x00;
-    t.tx_data[3] = 0x00;
+    /* ── 1. 解锁嵌入式功能寄存器 ── */
+    _setEmbAccess(true);
 
-    if (_spi_mutex) xSemaphoreTake(_spi_mutex, portMAX_DELAY);
-    esp_err_t ret = spi_device_transmit(_spi, &t);
-    if (_spi_mutex) xSemaphoreGive(_spi_mutex);
+    /* ── 2. 设置 SFLP ODR ── */
+    writeReg(LSM_SFLP_GAME_ODR, (odr & 0x07));
 
-    ESP_LOGI(TAG, "  写 0x%02X=0x%02X → MISO rx[0]=0x%02X rx[1]=0x%02X",
-             reg, val, t.rx_data[0], t.rx_data[1]);
-    return ret == ESP_OK;
+    /* ── 3. 使能 Game Rotation Vector → FIFO ── */
+    writeReg(LSM_EMB_FUNC_FIFO_EN_A, LSM_SFLP_GAME_FIFO_EN);
+
+    /* ── 4. FIFO 流模式 ── */
+    writeReg(LSM_FIFO_CTRL4, LSM_FIFO_MODE_CONTINUOUS);
+
+    /* ── 5. 启动 SFLP Game Rotation Vector ── */
+    writeReg(LSM_EMB_FUNC_EN_A, LSM_SFLP_GAME_EN);
+
+    /* ── 6. 锁回嵌入式寄存器 ── */
+    _setEmbAccess(false);
+
+    _sflp_enabled = true;
+    ESP_LOGI(TAG, "SFLP 启动: Game Rotation Vector ODR=%d", odr);
+    return true;
 }
 
-bool QMI8658::readRegs(uint8_t reg, uint8_t *buf, uint8_t len)
+bool LSM6DSV16X::sflpIsReady()
 {
-    if (len > 14) return false;
-
-    uint8_t tx[18] = {0};
-    uint8_t rx[18] = {0};
-    tx[0] = (reg | QMI8658_SPI_READ);
-
-    spi_transaction_t t = {};
-    t.flags     = 0;
-    t.length    = (1 + len) * 8;
-    t.tx_buffer = tx;
-    t.rx_buffer = rx;
-
-    if (_spi_mutex) xSemaphoreTake(_spi_mutex, portMAX_DELAY);
-    esp_err_t ret = spi_device_transmit(_spi, &t);
-    if (_spi_mutex) xSemaphoreGive(_spi_mutex);
-
-    std::memcpy(buf, rx + 1, len);
-    return ret == ESP_OK;
+    /* FIFO 中有数据即就绪 (不读 TAG, 避免副作用) */
+    return (_readFifoCount() > 0);
 }
 
-bool QMI8658::readReg(uint8_t reg, uint8_t &val)
+LSM6DSV16X::SFLPData LSM6DSV16X::sflpRead()
 {
-    /* tx_data[0] 先发 (低字节优先, ESP-IDF 文档明确) */
-    spi_transaction_t t = {};
-    t.flags      = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-    t.length     = 16;
-    t.tx_data[0] = (uint8_t)(reg | QMI8658_SPI_READ); // 第一字节: 地址 + 读标志
-    t.tx_data[1] = 0x00;                                // 第二字节: dummy
-    t.tx_data[2] = 0x00;
-    t.tx_data[3] = 0x00;
+    SFLPData d = {};
+    if (!_sflp_enabled) return d;
 
-    if (_spi_mutex) xSemaphoreTake(_spi_mutex, portMAX_DELAY);
-    esp_err_t ret = spi_device_transmit(_spi, &t);
-    if (_spi_mutex) xSemaphoreGive(_spi_mutex);
+    /* ── 1. 读 FIFO 水位, 确保有足够数据 ── */
+    uint16_t count = _readFifoCount();
+    if (count == 0) return d;
 
-    val = t.rx_data[1];   // rx_data[1] = 第二字节 (芯片在该字节输出寄存器值)
-    return ret == ESP_OK;
-}
+    /* ── 2. 读 TAG ── */
+    uint8_t tag = _readFifoTag();
 
-/* ================================================================ */
-
-void QMI8658::scanRegisters()
-{
-    ESP_LOGI(TAG, "===== QMI8658 寄存器扫描 (软件CS) =====");
-
-    /* SPI 帧诊断 */
-    ESP_LOGI(TAG, "-- SPI 帧诊断 (reg 0x00) --");
-    for (int bits = 8; bits <= 32; bits += 8) {
-        spi_transaction_t t = {};
-        t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-        t.length = bits;
-        t.tx_data[0] = (0x00 | 0x80);  // 第一字节: 读 WHO_AM_I
-        t.tx_data[1] = 0x00;           // 第二字节: dummy
-        spi_device_transmit(_spi, &t);
-        ESP_LOGI(TAG, "  %d-bit: rx[0]=0x%02X [1]=0x%02X [2]=0x%02X [3]=0x%02X",
-                 bits, t.rx_data[0], t.rx_data[1], t.rx_data[2], t.rx_data[3]);
-    }
-
-    /* 写-读回测试: CTRL2 */
-    uint8_t orig = 0;
-    readReg(QMI8658_REG_CTRL2, orig);
-    ESP_LOGI(TAG, "CTRL2(0x03) 原值=0x%02X → 写0xA5", orig);
-
-    writeReg(QMI8658_REG_CTRL2, 0xA5);
-    vTaskDelay(pdMS_TO_TICKS(2));
-
-    uint8_t test = 0;
-    readReg(QMI8658_REG_CTRL2, test);
-    ESP_LOGI(TAG, "CTRL2 读回=0x%02X %s", test,
-             (test == 0xA5) ? "✓ SPI 写入正常!" : "✗ SPI 写入失败");
-
-    writeReg(QMI8658_REG_CTRL2, orig);
-
-    /* 全地址 dump */
-    ESP_LOGI(TAG, "Addr: [rx0 rx1] 每行16个寄存器");
-    for (int addr = 0; addr < 128; addr += 16) {
-        char l0[80] = {0}, l1[80] = {0};
-        int o0 = snprintf(l0, sizeof(l0), "%02X(r0):", addr);
-        int o1 = snprintf(l1, sizeof(l1), "%02X(r1):", addr);
-        for (int i = 0; i < 16; i++) {
-            spi_transaction_t t = {};
-            t.flags      = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-            t.length     = 16;
-            t.tx_data[0] = (uint8_t)((addr + i) | 0x80); // 第一字节: 读地址
-            t.tx_data[1] = 0x00;                          // 第二字节: dummy
-            spi_device_transmit(_spi, &t);
-            o0 += snprintf(l0 + o0, sizeof(l0) - o0, "%02X ", t.rx_data[0]);
-            o1 += snprintf(l1 + o1, sizeof(l1) - o1, "%02X ", t.rx_data[1]);
+    /* ── 3. 根据 TAG 解析 ── */
+    switch (tag) {
+    case LSM_SFLP_GAME_ROTATION_VECTOR_TAG:   /* 0x13: 四元数 */
+        {
+            uint8_t buf[6];
+            if (!_readFifoData(buf, 6)) return d;
+            /* 字节序: XL, YL, ZL, XH, YH, ZH */
+            uint16_t hx = ((uint16_t)buf[3] << 8) | buf[0];
+            uint16_t hy = ((uint16_t)buf[4] << 8) | buf[1];
+            uint16_t hz = ((uint16_t)buf[5] << 8) | buf[2];
+            d.quat.qx = _halfToFloat(hx);
+            d.quat.qy = _halfToFloat(hy);
+            d.quat.qz = _halfToFloat(hz);
+            float sq = d.quat.qx * d.quat.qx
+                     + d.quat.qy * d.quat.qy
+                     + d.quat.qz * d.quat.qz;
+            d.quat.qw = (sq <= 1.0f) ? std::sqrt(1.0f - sq) : 0.0f;
+            break;
         }
-        ESP_LOGI(TAG, "%s", l0);
-        ESP_LOGI(TAG, "%s", l1);
+    case LSM_SFLP_GRAVITY_VECTOR_TAG:         /* 0x14: 重力向量 */
+        {
+            uint8_t buf[6];
+            if (!_readFifoData(buf, 6)) return d;
+            uint16_t hx = ((uint16_t)buf[3] << 8) | buf[0];
+            uint16_t hy = ((uint16_t)buf[4] << 8) | buf[1];
+            uint16_t hz = ((uint16_t)buf[5] << 8) | buf[2];
+            d.gravity[0] = _halfToFloat(hx);
+            d.gravity[1] = _halfToFloat(hy);
+            d.gravity[2] = _halfToFloat(hz);
+            break;
+        }
+    case LSM_SFLP_GYROSCOPE_BIAS_TAG:         /* 0x15: 陀螺仪零偏 */
+        {
+            uint8_t buf[6];
+            if (!_readFifoData(buf, 6)) return d;
+            int16_t gbx = (int16_t)(((uint16_t)buf[1] << 8) | buf[0]);
+            int16_t gby = (int16_t)(((uint16_t)buf[3] << 8) | buf[2]);
+            int16_t gbz = (int16_t)(((uint16_t)buf[5] << 8) | buf[4]);
+            d.gbias[0] = (float)gbx * LSM_GYRO_LSB_2000DPS * 0.001f;
+            d.gbias[1] = (float)gby * LSM_GYRO_LSB_2000DPS * 0.001f;
+            d.gbias[2] = (float)gbz * LSM_GYRO_LSB_2000DPS * 0.001f;
+            break;
+        }
+    default:
+        /* 未知 TAG: 清空该条目 (读 6 字节丢弃, 防止 FIFO 阻塞) */
+        {
+            uint8_t dummy[6];
+            _readFifoData(dummy, 6);
+            break;
+        }
     }
-    ESP_LOGI(TAG, "===== 扫描完成 =====");
+
+    return d;
 }
 
-void QMI8658::_applyScale()
+/* ================================================================
+ * SPI 读写 — ST MEMS 协议
+ *
+ *   bit0 = 1 读, bit0 = 0 写
+ *   tx_data[0] = (reg << 1) | RW
+ *   写: 只用 TXDATA (全双工模式)
+ *   读: TXDATA | RXDATA
+ * ================================================================ */
+
+bool LSM6DSV16X::writeReg(uint8_t reg, uint8_t val)
 {
-    _accel_lsb = 9.80665f / QMI8658_ACC_LSB_2G;
-    _gyro_lsb  = 1.0f / QMI8658_GYRO_LSB_2048DPS;
+    if (!_spi) return false;
+
+    spi_transaction_t t = {};
+    t.flags      = SPI_TRANS_USE_TXDATA;
+    t.length     = 16;
+    t.tx_data[0] = (uint8_t)((reg << 1) & 0xFE);  /* bit0=0 写 */
+    t.tx_data[1] = val;
+
+    _spi_lock_acquire();
+    esp_err_t ret = spi_device_transmit(_spi, &t);
+    _spi_lock_release();
+    return ret == ESP_OK;
+}
+
+bool LSM6DSV16X::readReg(uint8_t reg, uint8_t &val)
+{
+    if (!_spi) return false;
+
+    spi_transaction_t t = {};
+    t.flags      = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+    t.length     = 16;
+    t.tx_data[0] = (uint8_t)((reg << 1) | 0x01);  /* bit0=1 读 */
+    t.tx_data[1] = 0x00;                           /* 空字节, 数据在 rx[1] */
+
+    _spi_lock_acquire();
+    esp_err_t ret = spi_device_transmit(_spi, &t);
+    _spi_lock_release();
+    val = t.rx_data[1];
+    return ret == ESP_OK;
+}
+
+bool LSM6DSV16X::readRegs(uint8_t reg, uint8_t *buf, uint8_t len)
+{
+    if (!_spi || !buf || len == 0) return false;
+
+    /* DMA 安全: 最大 16B 数据 + 1B 命令 = 17B, 补齐到 4B 倍数 */
+    if (len > 16) return false;
+
+    uint8_t total = (uint8_t)((len + 1 + 3) & ~3u);  /* 向上补齐到 4B 倍数 */
+    std::memset(_dma_tx, 0, total);
+    std::memset(_dma_rx, 0, total);
+
+    _dma_tx[0] = (uint8_t)((reg << 1) | 0x01);  /* 读命令 + IF_INC 自增 */
+
+    spi_transaction_t t = {};
+    t.length    = total * 8;      /* 补齐后长度 (bit) */
+    t.tx_buffer = _dma_tx;
+    t.rx_buffer = _dma_rx;
+
+    _spi_lock_acquire();
+    esp_err_t ret = spi_device_transmit(_spi, &t);
+    _spi_lock_release();
+
+    /* 数据在 _dma_rx[1..len] (rx[0] 是命令字节返回) */
+    std::memcpy(buf, _dma_rx + 1, len);
+    return ret == ESP_OK;
+}
+
+/* ================================================================
+ * 内部辅助函数
+ * ================================================================ */
+
+void LSM6DSV16X::_applyScale()
+{
+    /* 加速度计: mg/LSB → m/s²  (0.061 mg * 0.001 g/mg * 9.80665 m/s²/g) */
+    _accel_lsb = LSM_ACCEL_LSB_2G * 0.001f * 9.80665f;
+    /* 陀螺仪: mdps/LSB → dps */
+    _gyro_lsb  = LSM_GYRO_LSB_2000DPS * 0.001f;
+}
+
+void LSM6DSV16X::_setEmbAccess(bool enable)
+{
+    uint8_t val = enable ? LSM_FUNC_CFG_EMB_ACCESS : 0x00;
+    writeReg(LSM_FUNC_CFG_ACCESS, val);
+}
+
+uint16_t LSM6DSV16X::_readFifoCount()
+{
+    uint8_t l, h;
+    readReg(LSM_FIFO_STATUS1, l);
+    readReg(LSM_FIFO_STATUS2, h);
+    return ((uint16_t)(h & 0x01) << 8) | l;
+}
+
+uint8_t LSM6DSV16X::_readFifoTag()
+{
+    uint8_t tag = 0;
+    readReg(LSM_FIFO_DATA_OUT_TAG, tag);
+    return tag;
+}
+
+bool LSM6DSV16X::_readFifoData(uint8_t *buf, uint8_t len)
+{
+    return readRegs(LSM_FIFO_DATA_OUT_X_L, buf, len);
+}
+
+/* ================================================================
+ * half-precision float (IEEE 754 binary16) → float32
+ *
+ * 位布局: [15]符号 [14:10]指数(bias=15) [9:0]尾数
+ *
+ * 基于 ST lsm6dsv16x_reg.c 的 ToFloatBits() 实现
+ * 版权: STMicroelectronics / BSD-3-Clause
+ * ================================================================ */
+
+static uint32_t _ToFloatBits(uint16_t h)
+{
+    uint16_t h_exp = (h & 0x7C00u);
+    uint32_t f_sgn = ((uint32_t)h & 0x8000u) << 16u;
+    uint32_t result = 0;
+
+    switch (h_exp) {
+    case 0x0000u: {  /* 0 或 subnormal */
+        uint16_t h_sig = (h & 0x03FFu);
+        if (h_sig == 0u) {
+            result = f_sgn;       /* ±0 */
+            break;
+        }
+        /* 规整化 subnormal */
+        h_sig <<= 1u;
+        while ((h_sig & 0x0400u) == 0u) {
+            h_sig <<= 1u;
+            h_exp++;
+        }
+        uint32_t f_exp = ((uint32_t)(127u - 15u - (uint32_t)h_exp)) << 23u;
+        uint32_t f_sig = ((uint32_t)(h_sig & 0x03FFu)) << 13u;
+        result = f_sgn + f_exp + f_sig;
+        break;
+    }
+    case 0x7C00u:  /* inf 或 NaN */
+        result = f_sgn + 0x7F800000u + (((uint32_t)(h & 0x03FFu)) << 13u);
+        break;
+    default:  /* normalized */
+        result = f_sgn + (((uint32_t)(h & 0x7FFFu) + 0x1C000u) << 13u);
+        break;
+    }
+    return result;
+}
+
+static float _halfToFloat(uint16_t h)
+{
+    uint32_t bits = _ToFloatBits(h);
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
 }

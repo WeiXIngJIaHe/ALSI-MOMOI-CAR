@@ -13,8 +13,8 @@
  *   if (wifi.isConnected()) { ... }
  * ================================================================ */
 
-#define WIFI_SSID                   "your_ssid"
-#define WIFI_PASS                   "your_password"
+#define WIFI_SSID                   "JiaHe"
+#define WIFI_PASS                   "12345678"
 #define WIFI_MAX_RETRY              5
 #define WIFI_RETRY_INTERVAL_MS      5000
 

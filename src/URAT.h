@@ -25,8 +25,8 @@
  * ================================================================ */
 
 /* ---- 硬件引脚 (上位机通信) ---- */
-#define URAT_TX_PIN                 43
-#define URAT_RX_PIN                 44
+#define URAT_TX_PIN                 17
+#define URAT_RX_PIN                 18
 #define URAT_BAUDRATE               115200
 #define URAT_RX_BUF_SIZE            2048
 #define URAT_TX_BUF_SIZE            512

@@ -29,8 +29,8 @@
  * ================================================================ */
 
 /* ---- 硬件引脚 ---- */
-#define IS31FL3239_SCL              5
-#define IS31FL3239_SDA              6
+#define IS31FL3239_SCL              4
+#define IS31FL3239_SDA              5
 #define IS31FL3239_I2C_ADDR         0x3C    /* AD=GND; AD=VCC → 0x3F */
 
 /* ---- 通道数 ---- */

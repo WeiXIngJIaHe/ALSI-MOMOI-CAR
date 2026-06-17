@@ -18,8 +18,8 @@
  *   P0=RS  P1=RW  P2=EN  P3=BL
  *   P4=D4  P5=D5  P6=D6  P7=D7
  * ================================================================ */
-#define LCD1602_SCL                 5
-#define LCD1602_SDA                 6
+#define LCD1602_SCL                 4
+#define LCD1602_SDA                 5
 #define LCD1602_I2C_ADDR            0x27
 #define LCD1602_COLS                16
 #define LCD1602_ROWS                2

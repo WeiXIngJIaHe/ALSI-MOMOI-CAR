@@ -5,7 +5,6 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
 #include <cstring>
 
 static const char *TAG = "WiFi";
@@ -57,14 +56,12 @@ bool WiFi::isConnected()
 
 bool WiFi::waitConnected(uint32_t timeout_ms)
 {
-    EventGroupHandle_t evg = xEventGroupCreate();
-    /* 轮询等待 (事件回调在另一个任务中, 此处简单轮询) */
+    /* 轮询等待连接 (WiFi 事件在独立任务中回调) */
     uint32_t elapsed = 0;
-    const uint32_t tick = 100;
+    const uint32_t tick = 20;
 
     while (elapsed < timeout_ms) {
         if (_connected) {
-            vEventGroupDelete(evg);
             ESP_LOGI(TAG, "已连接! IP: %s", ip());
             return true;
         }
@@ -72,7 +69,6 @@ bool WiFi::waitConnected(uint32_t timeout_ms)
         elapsed += tick;
     }
 
-    vEventGroupDelete(evg);
     ESP_LOGE(TAG, "连接超时");
     return false;
 }
