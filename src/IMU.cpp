@@ -23,6 +23,7 @@
 #include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <cstring>
 #include <cmath>
 
@@ -31,23 +32,22 @@ static const char *TAG = "LSM6DSV16X";
 /* ── 前置声明 ── */
 static float _halfToFloat(uint16_t h);
 
-/* ── DMA 安全缓冲池 (DRAM + 4B 对齐)
- *    ESP-IDF DMA 要求: 内存在 DRAM 中, 32bit 对齐, 长度为 4B 倍数
- *    使用 DRAM_ATTR 确保在内部 SRAM (MALLOC_CAP_DMA)
- *    栈分配不可靠 (可能不在 DMA 区域), 用静态缓冲避免驱动内部 memcpy ── */
-#define DMA_POOL_SIZE  20   /* 最大 16B 数据 + 1B 命令 = 17, 补齐到 20 (5×4) */
+/* ── DMA-safe buffer pool (DRAM + 32-bit aligned, 4-byte multiple) ── */
+#define DMA_POOL_SIZE  20
 
 static DRAM_ATTR uint8_t __attribute__((aligned(4))) _dma_tx[DMA_POOL_SIZE];
 static DRAM_ATTR uint8_t __attribute__((aligned(4))) _dma_rx[DMA_POOL_SIZE];
 
-/* 互斥锁 — SPI 设备被 Core0(传感器) 和 Core1(UART命令) 共用 */
-static portMUX_TYPE _spi_lock = portMUX_INITIALIZER_UNLOCKED;
+/* FreeRTOS mutex — SPI shared between Core0 (sensor) and Core1 (UART cmd)
+ * DO NOT use portENTER_CRITICAL here: it disables interrupts,
+ * which blocks SPI DMA completion → crash */
+static SemaphoreHandle_t _spi_mutex = NULL;
 
 static inline void _spi_lock_acquire() {
-    portENTER_CRITICAL(&_spi_lock);
+    if (_spi_mutex) xSemaphoreTake(_spi_mutex, portMAX_DELAY);
 }
 static inline void _spi_lock_release() {
-    portEXIT_CRITICAL(&_spi_lock);
+    if (_spi_mutex) xSemaphoreGive(_spi_mutex);
 }
 
 /* ── 静态: 总线只初始化一次 ── */
@@ -65,8 +65,11 @@ static void _spi_ensure()
     cfg.max_transfer_sz = 4096;
     cfg.flags           = 0;  /* 主模式, 无特殊标志 */
     spi_bus_initialize(IMU_SPI_HOST, &cfg, SPI_DMA_CH_AUTO);
+
+    if (!_spi_mutex) _spi_mutex = xSemaphoreCreateMutex();
+
     _spi_ready = true;
-    ESP_LOGI(TAG, "SPI总线: SCLK=%d MOSI=%d MISO=%d CS=%d CLK=%dHz",
+    ESP_LOGI(TAG, "SPI bus: SCLK=%d MOSI=%d MISO=%d CS=%d @ %dHz",
              IMU_SCLK, IMU_MOSI, IMU_MISO, IMU_CS, (int)IMU_SPI_CLK_HZ);
 }
 
@@ -333,14 +336,11 @@ LSM6DSV16X::SFLPData LSM6DSV16X::sflpRead()
     return d;
 }
 
-/* ================================================================
- * SPI 读写 — ST MEMS 协议
- *
- *   bit0 = 1 读, bit0 = 0 写
- *   tx_data[0] = (reg << 1) | RW
- *   写: 只用 TXDATA (全双工模式)
- *   读: TXDATA | RXDATA
- * ================================================================ */
+/* ── SPI 读写 — ST MEMS 标准协议 ──
+ * 命令格式: (寄存器地址 << 1) | R/W位
+ *   R/W=0 写: CS↓ → [cmd] [data] → CS↑  (只用 TXDATA)
+ *   R/W=1 读: CS↓ → [cmd] [dummy] → CS↑ (TXDATA|RXDATA, 结果在 rx[1])
+ * 互斥锁: FreeRTOS mutex (不禁中断, 避免 DMA 死锁) */
 
 bool LSM6DSV16X::writeReg(uint8_t reg, uint8_t val)
 {
@@ -440,14 +440,10 @@ bool LSM6DSV16X::_readFifoData(uint8_t *buf, uint8_t len)
     return readRegs(LSM_FIFO_DATA_OUT_X_L, buf, len);
 }
 
-/* ================================================================
- * half-precision float (IEEE 754 binary16) → float32
- *
- * 位布局: [15]符号 [14:10]指数(bias=15) [9:0]尾数
- *
- * 基于 ST lsm6dsv16x_reg.c 的 ToFloatBits() 实现
- * 版权: STMicroelectronics / BSD-3-Clause
- * ================================================================ */
+/* ── IEEE 754 half-precision float → float32 ──
+ * binary16 布局: bit[15]符号 bit[14:10]指数(bias=15) bit[9:0]尾数
+ * 移植自 ST 官方 lsm6dsv16x_reg.c (BSD-3-Clause)
+ * SFLP 四元数 XYZ 分量以 half-float 存入 FIFO, W=√(1-X²-Y²-Z²) */
 
 static uint32_t _ToFloatBits(uint16_t h)
 {

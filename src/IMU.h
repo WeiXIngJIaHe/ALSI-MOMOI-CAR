@@ -1,39 +1,22 @@
 #pragma once
-/* ================================================================
- * LSM6DSV16X 6轴 IMU — SPI 驱动 (ESP-IDF 5.5)
- *
- * ST MEMS SPI 协议:
- *   命令字节 = {AD[6:0], R/W}  其中 bit0=1 读, bit0=0 写
- *   读: CS↓ → [(reg<<1)|0x01] → [dummy] → CS↑  数据在 rx[1]
- *   写: CS↓ → [(reg<<1)|0x00] → [data]   → CS↑  只用 TXDATA
- *
- * WHO_AM_I = 0x70 @ 0x0F
- *
- * 功能:
- *   - 原始加速度计 / 陀螺仪 / 温度读取
- *   - SFLP 内置 6 轴姿态融合 → Game Rotation Vector (四元数)
- *   - FIFO 中断 / 轮询读取
- *   - 陀螺仪零偏自动校准
- * ================================================================ */
+/* LSM6DSV16X 6-axis IMU — SPI driver (ESP-IDF 5.5)
+ * ST MEMS SPI: cmd = (reg<<1) | R/W, bit0=1 read, 0 write
+ * WHO_AM_I = 0x70, SFLP on-chip 6-DoF quaternion output */
 
 #include <stdint.h>
 #include "driver/spi_master.h"
 
-/* ================================================================
- * SPI 硬件引脚 (与 QMI8658 共用)
- * ================================================================ */
+/* ---- SPI pins ---- */
 #define IMU_CS          10
 #define IMU_SCLK        9
 #define IMU_MOSI        8
 #define IMU_MISO        7
 #define IMU_SPI_HOST    SPI2_HOST
-#define IMU_SPI_CLK_HZ  6000000     /* 6MHz — LSM6DSV16X 支持 ≤10MHz */
+#define IMU_SPI_CLK_HZ  6000000
 #define IMU_INT1_PIN    6
 #define IMU_INT2_PIN    -1
 
-/* ================================================================
- * LSM6DSV16X 寄存器地址
- * ================================================================ */
+/* ---- Register map ---- */
 /* 基本配置 */
 #define LSM_FUNC_CFG_ACCESS     0x01    /* 嵌入式功能访问 */
 #define LSM_PIN_CTRL            0x02    /* 引脚控制 */

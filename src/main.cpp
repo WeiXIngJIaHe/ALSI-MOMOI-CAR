@@ -1,16 +1,20 @@
-/*---- 双核框架 (C++ 类架构) ----
- * Core0: 传感器采集 + SFLP/Mahony 姿态解算 (10ms)
- * Core1: 控制 + 电机 + UI              (10ms)
+/*---- 双核实时框架 (ESP32-S3, C++ OOP) ----
+ * Core0 (优先级高): 传感器 2ms → 姿态解算 → 队列发送
+ * Core1 (优先级低): 队列接收 → PID 控制 → 电机/UI/UART/WiFi
  *
- * 共用 I2C_NUM_0: IS31FL3239(0x3C) + TCA6408(0x20) + LCD(0x27)
- * SPI2_HOST:      LSM6DSV16X (独立 SPI 总线, DMA)
- * UART1:          上位机通信 (TX=43, RX=44, 115200bps)
- * UART0:          USB Serial/JTAG 调试口
- * LED:   12 组 RGB → IS31FL3239 (36 通道, 每 RGB 占 3 通道)
- * 按键:  4 键 → TCA6408
- * IMU:   6轴 → LSM6DSV16X (SPI DMA) + SFLP 原生四元数
- *                 + Mahony 互补滤波 (备用)
- * WiFi:  STA 模式 → MQTT
+ * 总线分配:
+ *   I2C_NUM_0  → IS31FL3239(0x3C) LED驱动 + TCA6408(0x20) IO扩展 + LCD1602(0x27)
+ *   SPI2_HOST  → LSM6DSV16X IMU (DMA, 独立总线)
+ *   UART1      → 上位机通信 (TX=43 RX=44)
+ *   UART0      → USB Serial/JTAG 调试
+ *
+ * 传感器融合:
+ *   SFLP (芯片内置) → Game Rotation Vector 四元数 @ 120Hz
+ *   Mahony (软件)   → 互补滤波, Ki 积分项消除陀螺零漂
+ *
+ * 数据流:
+ *   Core0: IMU → readAll() → SFLP + Mahony → Msg → Queue → Core1
+ *   Core1: Queue → Msg → PID → Motor / UART / WiFi
  */
 
 #include "IS31FL3239.h"
@@ -78,11 +82,18 @@ struct Msg {
 };
 static QueueHandle_t _sq, _cq;
 
-/* ================================================================ */
+/* ── 硬件初始化 (app_main 中调用, 阻塞执行) ──
+ * NVS → I2C 设备 → LED/按键/电机 → UART → WiFi → IMU → 姿态融合
+ * 全部完成后设 INIT_BIT_HW_READY 解锁双核任务 */
 static void hw_init()
 {
-    /* NVS (WiFi 需要, 否则崩溃) */
-    nvs_flash_init();
+    // NVS: WiFi 必需, 损坏则自动擦除重试 (ESP-IDF 标准模式)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 
     /* I2C 总线: IS31FL3239 init 内部触发一次性初始化 */
     g_led_drv.init();
@@ -99,17 +110,18 @@ static void hw_init()
     /* UART */
     g_uart.init();
 
-    /* WiFi + MQTT */
-    g_wifi.init();
-    /*if (g_wifi.waitConnected(10000)) {
-        ESP_LOGI(TAG, "WiFi 已连接, 启动 MQTT");
-        g_mqtt.init();
-        g_mqtt.subscribe("/car/cmd");
-        g_mqtt.subscribe("/car/led");
-        g_wifi_remote.init();
-    } else {
-        ESP_LOGW(TAG, "WiFi 未连接, MQTT/WiFi遥控 跳过");
-    }*/
+    /* WiFi */
+    if (g_wifi.init()) {
+        /* 天线射频测试: 扫描周围 AP, 打印 RSSI (dBm) */
+        g_wifi.scanStart();
+
+        /* 连接后初始化 MQTT (需要正确 SSID/密码) */
+        //if (g_wifi.waitConnected(10000)) {
+        //    g_mqtt.init();
+        //    g_mqtt.subscribe("/car/cmd");
+        //    g_wifi_remote.init();
+        //}
+    }
 
     if (!g_imu.begin())
         ESP_LOGE(TAG, "IMU 初始化失败!");
@@ -130,7 +142,9 @@ static void hw_init()
     if (_init_evt) xEventGroupSetBits(_init_evt, INIT_BIT_HW_READY);
 }
 
-/* ================================================================ */
+/* ── Core0: 传感器采集 + 姿态融合 (100Hz)
+ *   readAll() DMA 突发 → SFLP 四元数 → Mahony 去零漂 → 队列发送
+ *   每 500ms 打印一次: 加速度/角速度/四元数/欧拉角/WiFi RSSI */
 static void core0_sensor(void *pv)
 {
     if (_init_evt)
@@ -177,11 +191,12 @@ static void core0_sensor(void *pv)
 
         if (++pr_cnt >= 50) {
             float bz = g_mahony.biasZ();
+            int wifi_rssi = g_wifi.getRSSI();
             ESP_LOGI(TAG, "ACC(m/s²): %.2f %.2f %.2f | GYRO(dps): %.1f %.1f %.1f | BiasZ: %.4f",
                      d.ax, d.ay, d.az, d.gx, d.gy, d.gz, bz);
-            ESP_LOGI(TAG, "Mahony Q: %.4f %.4f %.4f %.4f | Euler(°): %.1f %.1f %.1f",
+            ESP_LOGI(TAG, "Mahony Q: %.4f %.4f %.4f %.4f | Euler(°): %.1f %.1f %.1f | WiFi: %d dBm",
                      mahony_qw, mahony_qx, mahony_qy, mahony_qz,
-                     roll * 57.3f, pitch * 57.3f, yaw * 57.3f);
+                     roll * 57.3f, pitch * 57.3f, yaw * 57.3f, wifi_rssi);
 #if USE_SFLP
             if (sflp_qw != 0 || sflp_qx != 0 || sflp_qy != 0 || sflp_qz != 0)
                 ESP_LOGI(TAG, "SFLP Q: %.4f %.4f %.4f %.4f",
@@ -198,7 +213,9 @@ static void core0_sensor(void *pv)
     }
 }
 
-/* ================================================================ */
+/* ── Core1: 控制中枢
+ *   队列接收姿态 → PID 平衡/转向 → 电机驱动
+ *   外设扫描: 按键/WiFi遥控/MQTT/UART 协议解析 */
 static void core1_ctrl(void *pv)
 {
     /* 等待硬件初始化完成 */
@@ -304,10 +321,13 @@ static void core1_ctrl(void *pv)
     }
 }
 
-/* ================================================================ */
+/* ── 固件入口 ──
+ *   硬件初始化 (阻塞) → 创建队列 → 启动双核任务 → 自身退出
+ *   任务由 INIT_BIT_HW_READY 事件位同步, 确保硬件就绪后才运行 */
 extern "C" void app_main()
 {
-    setvbuf(stdout, NULL, _IONBF, 0);  /* stdout 无缓冲, 立即输出 */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    setvbuf(stdout, NULL, _IONBF, 0);  // stdout 无缓冲, 日志立即输出
     ESP_LOGI(TAG, "===== 固件启动 v5 — LSM6DSV16X SFLP+Mahony =====");
 
     _init_evt = xEventGroupCreate();
