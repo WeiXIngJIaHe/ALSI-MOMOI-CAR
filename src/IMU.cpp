@@ -21,6 +21,7 @@
 #include "IMU.h"
 #include "esp_log.h"
 #include "esp_attr.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -56,6 +57,13 @@ static bool _spi_ready = false;
 static void _spi_ensure()
 {
     if (_spi_ready) return;
+
+    /* CS 先拉低再初始化 SPI — LSM6DSV16X 上电时检测 CS 电平选接口:
+     * CS=HIGH → I2C 模式, CS=LOW → SPI 模式. 必须在总线初始化前拉低 */
+    gpio_set_direction((gpio_num_t)IMU_CS, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)IMU_CS, 0);
+    vTaskDelay(pdMS_TO_TICKS(1));  /* 给芯片 1ms 锁定 SPI 模式 */
+
     spi_bus_config_t cfg = {};
     cfg.mosi_io_num     = IMU_MOSI;
     cfg.miso_io_num     = IMU_MISO;
@@ -63,7 +71,7 @@ static void _spi_ensure()
     cfg.quadwp_io_num   = -1;
     cfg.quadhd_io_num   = -1;
     cfg.max_transfer_sz = 4096;
-    cfg.flags           = 0;  /* 主模式, 无特殊标志 */
+    cfg.flags           = 0;
     spi_bus_initialize(IMU_SPI_HOST, &cfg, SPI_DMA_CH_AUTO);
 
     if (!_spi_mutex) _spi_mutex = xSemaphoreCreateMutex();
@@ -89,52 +97,74 @@ LSM6DSV16X::~LSM6DSV16X()
     if (_spi) spi_bus_remove_device(_spi);
 }
 
-/* ================================================================
- * begin() — 复位 + WHO_AM_I 校验 + 基础配置
- * ================================================================ */
+/* ── 全寄存器扫描 (诊断用, 打印所有可读寄存器值) ── */
+static void _dumpRegs(spi_device_handle_t spi)
+{
+    ESP_LOGI(TAG, "===== 寄存器扫描 =====");
+
+    struct { uint8_t addr; const char *name; } regs[] = {
+        {0x01, "FUNC_CFG_ACCESS"}, {0x02, "PIN_CTRL"}, {0x03, "IF_CFG"},
+        {0x04, "EMB_FUNC_EN_A"},   {0x05, "EMB_FUNC_EN_B"},
+        {0x07, "FIFO_CTRL1"},      {0x08, "FIFO_CTRL2"},
+        {0x09, "FIFO_CTRL3"},      {0x0A, "FIFO_CTRL4"},
+        {0x0D, "INT1_CTRL"},       {0x0E, "INT2_CTRL"},
+        {0x0F, "WHO_AM_I"},        {0x10, "CTRL1"},
+        {0x11, "CTRL2"},           {0x12, "CTRL3"},
+        {0x13, "CTRL4"},           {0x14, "CTRL5"},
+        {0x15, "CTRL6"},           {0x16, "CTRL7"},
+        {0x17, "CTRL8"},           {0x18, "CTRL9"},
+        {0x19, "CTRL10"},          {0x1A, "CTRL_STATUS"},
+        {0x1B, "FIFO_STATUS1"},    {0x1C, "FIFO_STATUS2"},
+        {0x1D, "ALL_INT_SRC"},     {0x1E, "STATUS_REG"},
+        {0x20, "OUT_TEMP_L"},      {0x21, "OUT_TEMP_H"},
+    };
+
+    for (auto &r : regs) {
+        spi_transaction_t t = {};
+        t.flags      = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+        t.length     = 16;
+        t.tx_data[0] = (uint8_t)((r.addr << 1) | 0x01);
+        t.tx_data[1] = 0x00;
+        spi_device_transmit(spi, &t);
+        ESP_LOGI(TAG, "  0x%02X %-16s = 0x%02X", r.addr, r.name, t.rx_data[1]);
+    }
+    ESP_LOGI(TAG, "===== 扫描结束 =====");
+}
 
 bool LSM6DSV16X::begin()
 {
     _spi_ensure();
 
     spi_device_interface_config_t dev_cfg = {};
-    dev_cfg.mode             = 0;              /* CPOL=0, CPHA=0 */
+    dev_cfg.mode             = 3;              // LSM6DSV16X: CPOL=1 CPHA=1
     dev_cfg.clock_speed_hz   = IMU_SPI_CLK_HZ;
     dev_cfg.spics_io_num     = IMU_CS;
     dev_cfg.queue_size       = 1;
-    dev_cfg.cs_ena_pretrans  = 2;             /* CS 提前 2 个 SPI 位 */
-    dev_cfg.cs_ena_posttrans = 1;             /* CS 保持 1 个 SPI 位 */
+    // cs_ena_pretrans/posttrans 仅在半双工模式有效, 全双工由硬件 FSM 控制 CS
 
     if (spi_bus_add_device(IMU_SPI_HOST, &dev_cfg, &_spi) != ESP_OK)
         return false;
 
-    /* ── 软件复位 ── */
+    /* 全寄存器扫描 — 诊断 SPI 通信 */
+    _dumpRegs(_spi);
+
+    /* 软件复位 */
     writeReg(LSM_CTRL3, LSM_CTRL3_SW_RESET);
     vTaskDelay(pdMS_TO_TICKS(20));
 
-    /* ── WHO_AM_I 校验 ── */
+    /* WHO_AM_I 校验 */
     uint8_t id = whoAmI();
     ESP_LOGI(TAG, "WHO_AM_I=0x%02X %s", id, (id == LSM_WHO_AM_I_VAL) ? "OK" : "?");
 
-    /* ── 基础配置 ── */
-    /* CTRL3: 使能 BDU (Block Data Update) + IF_INC (地址自增) */
+    /* 基础配置 */
     writeReg(LSM_CTRL3, LSM_CTRL3_BDU | LSM_CTRL3_IF_INC);
-
-    /* CTRL1: 加速度计 120Hz 高性能模式 */
     writeReg(LSM_CTRL1, LSM_ODR_XL_120HZ);
-
-    /* CTRL2: 陀螺仪 120Hz 高性能模式 */
     writeReg(LSM_CTRL2, LSM_ODR_G_120HZ);
-
-    /* CTRL6: 陀螺仪 ±2000dps */
     writeReg(LSM_CTRL6, LSM_FS_G_2000DPS);
-
-    /* CTRL8: 加速度计 ±2g */
     writeReg(LSM_CTRL8, LSM_FS_XL_2G);
 
     _applyScale();
     ESP_LOGI(TAG, "初始化完成: ACC=±2g GYRO=±2000dps ODR=120Hz");
-
     return true;
 }
 
@@ -336,23 +366,26 @@ LSM6DSV16X::SFLPData LSM6DSV16X::sflpRead()
     return d;
 }
 
-/* ── SPI 读写 — ST MEMS 标准协议 ──
- * 命令格式: (寄存器地址 << 1) | R/W位
- *   R/W=0 写: CS↓ → [cmd] [data] → CS↑  (只用 TXDATA)
- *   R/W=1 读: CS↓ → [cmd] [dummy] → CS↑ (TXDATA|RXDATA, 结果在 rx[1])
+/* ── SPI 读写 — LSM6DSV16X 协议 (bit0=R/W) ──
+ * 写: cmd=(reg<<1)&0xFE, 只用 TXDATA
+ * 读: cmd=(reg<<1)|0x01, TXDATA|RXDATA, 结果在 rx[1]
  * 互斥锁: FreeRTOS mutex (不禁中断, 避免 DMA 死锁) */
 
 bool LSM6DSV16X::writeReg(uint8_t reg, uint8_t val)
 {
     if (!_spi) return false;
 
-    spi_transaction_t t = {};
-    t.flags      = SPI_TRANS_USE_TXDATA;
-    t.length     = 16;
-    t.tx_data[0] = (uint8_t)((reg << 1) & 0xFE);  /* bit0=0 写 */
-    t.tx_data[1] = val;
-
     _spi_lock_acquire();
+    std::memset(_dma_tx, 0, 4);
+    
+    // bit7 = 0 为写，寄存器地址不移位
+    _dma_tx[0] = reg & 0x7F;  
+    _dma_tx[1] = val;
+
+    spi_transaction_t t = {};
+    t.length    = 16;           // 发送 2 字节 = 16 bits
+    t.tx_buffer = _dma_tx;      // 使用字节流 buffer，强制顺序发送
+
     esp_err_t ret = spi_device_transmit(_spi, &t);
     _spi_lock_release();
     return ret == ESP_OK;
@@ -362,43 +395,54 @@ bool LSM6DSV16X::readReg(uint8_t reg, uint8_t &val)
 {
     if (!_spi) return false;
 
-    spi_transaction_t t = {};
-    t.flags      = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-    t.length     = 16;
-    t.tx_data[0] = (uint8_t)((reg << 1) | 0x01);  /* bit0=1 读 */
-    t.tx_data[1] = 0x00;                           /* 空字节, 数据在 rx[1] */
-
     _spi_lock_acquire();
+    std::memset(_dma_tx, 0, 4);
+    std::memset(_dma_rx, 0, 4);
+    
+    // bit7 = 1 为读，寄存器地址不移位
+    _dma_tx[0] = reg | 0x80; 
+    _dma_tx[1] = 0x00;          // Dummy 空字节
+
+    spi_transaction_t t = {};
+    t.length    = 16;
+    t.tx_buffer = _dma_tx;
+    t.rx_buffer = _dma_rx;
+
     esp_err_t ret = spi_device_transmit(_spi, &t);
+    val = _dma_rx[1];           // 第0字节是废数据，有效数据在第1字节
     _spi_lock_release();
-    val = t.rx_data[1];
     return ret == ESP_OK;
 }
 
 bool LSM6DSV16X::readRegs(uint8_t reg, uint8_t *buf, uint8_t len)
 {
     if (!_spi || !buf || len == 0) return false;
+    
+    // DMA 缓存保护：命令字节(1) + 数据字节(len) 不能超过 DMA_POOL_SIZE
+    if (len + 1 > DMA_POOL_SIZE) return false;
 
-    /* DMA 安全: 最大 16B 数据 + 1B 命令 = 17B, 补齐到 4B 倍数 */
-    if (len > 16) return false;
-
-    uint8_t total = (uint8_t)((len + 1 + 3) & ~3u);  /* 向上补齐到 4B 倍数 */
+    _spi_lock_acquire();
+    
+    // 向上补齐到 4 字节的倍数，满足 ESP32 DMA 硬件要求
+    uint8_t total = (uint8_t)((len + 1 + 3) & ~3u);
+    
     std::memset(_dma_tx, 0, total);
     std::memset(_dma_rx, 0, total);
 
-    _dma_tx[0] = (uint8_t)((reg << 1) | 0x01);  /* 读命令 + IF_INC 自增 */
+    // bit7 = 1 为读
+    _dma_tx[0] = reg | 0x80; 
 
     spi_transaction_t t = {};
-    t.length    = total * 8;      /* 补齐后长度 (bit) */
+    t.length    = total * 8;    // 传输总 bit 数
     t.tx_buffer = _dma_tx;
     t.rx_buffer = _dma_rx;
 
-    _spi_lock_acquire();
     esp_err_t ret = spi_device_transmit(_spi, &t);
-    _spi_lock_release();
-
-    /* 数据在 _dma_rx[1..len] (rx[0] 是命令字节返回) */
+    
+    // 掐头去尾：跳过第0字节(命令返回)，将 len 长度的有效数据拷给用户
     std::memcpy(buf, _dma_rx + 1, len);
+    
+    _spi_lock_release();
     return ret == ESP_OK;
 }
 

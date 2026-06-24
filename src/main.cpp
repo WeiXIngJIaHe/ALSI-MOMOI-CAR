@@ -192,11 +192,11 @@ static void core0_sensor(void *pv)
         if (++pr_cnt >= 50) {
             float bz = g_mahony.biasZ();
             int wifi_rssi = g_wifi.getRSSI();
+            float r_deg = roll * 57.3f, p_deg = pitch * 57.3f, y_deg = yaw * 57.3f;
             ESP_LOGI(TAG, "ACC(m/s²): %.2f %.2f %.2f | GYRO(dps): %.1f %.1f %.1f | BiasZ: %.4f",
                      d.ax, d.ay, d.az, d.gx, d.gy, d.gz, bz);
-            ESP_LOGI(TAG, "Mahony Q: %.4f %.4f %.4f %.4f | Euler(°): %.1f %.1f %.1f | WiFi: %d dBm",
-                     mahony_qw, mahony_qx, mahony_qy, mahony_qz,
-                     roll * 57.3f, pitch * 57.3f, yaw * 57.3f, wifi_rssi);
+            ESP_LOGI(TAG, "Angle(°): R=%.1f P=%.1f Y=%.1f | Mahony Q: %.4f %.4f %.4f %.4f | WiFi: %d dBm",
+                     r_deg, p_deg, y_deg, mahony_qw, mahony_qx, mahony_qy, mahony_qz, wifi_rssi);
 #if USE_SFLP
             if (sflp_qw != 0 || sflp_qx != 0 || sflp_qy != 0 || sflp_qz != 0)
                 ESP_LOGI(TAG, "SFLP Q: %.4f %.4f %.4f %.4f",
