@@ -1,0 +1,6 @@
+{
+    "cmake.environment": {
+        "IDF_PATH": "C:/Users/17368/.platformio/packages/framework-espidf"
+    },
+    "cmake.configureOnOpen": false
+}

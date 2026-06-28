@@ -10,8 +10,8 @@
  *   if (wifi.waitConnected(10000)) { ... }
  * ================================================================ */
 
-#define WIFI_SSID                   ""
-#define WIFI_PASS                   ""
+#define WIFI_SSID                   "JiaHe"
+#define WIFI_PASS                   "123456789"
 #define WIFI_MAX_RETRY              5
 
 class WiFi {

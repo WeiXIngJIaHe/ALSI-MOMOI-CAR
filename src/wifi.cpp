@@ -132,49 +132,11 @@ int WiFi::getRSSI()
     return rssi;// dBm, 未连接返回 0
 }
 
-// 主动扫描周围 AP, 测试天线接收灵敏度
-void WiFi::scanStart()
-{
-    wifi_scan_config_t cfg = {};
-    cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-    esp_wifi_scan_start(&cfg, true);   // true = 阻塞至扫描完成
-    scanLog();
-}
-
-// 打印扫描结果, 按 RSSI 评级天线性能
-void WiFi::scanLog()
-{
-    uint16_t num = 0;
-    esp_wifi_scan_get_ap_num(&num);
-    if (num == 0) {
-        ESP_LOGI(TAG, "RF scan: 未发现 AP (检查天线连接)");
-        return;
-    }
-
-    wifi_ap_record_t *list = (wifi_ap_record_t *)malloc(num * sizeof(wifi_ap_record_t));
-    if (!list) return;
-    esp_wifi_scan_get_ap_records(&num, list);
-
-    // RSSI 评级: ≥-55 优秀, -55~-70 良好, -70~-85 一般, <-85 差
-    for (uint16_t i = 0; i < num; i++) {
-        const char *qual;
-        if (list[i].rssi >= -55)      qual = "优秀";
-        else if (list[i].rssi >= -70) qual = "良好";
-        else if (list[i].rssi >= -85) qual = "一般";
-        else                          qual = "差";
-
-        ESP_LOGI(TAG, "AP[%d]: %s  CH=%d  RSSI=%d dBm  %s",
-                 i, list[i].ssid, list[i].primary, list[i].rssi, qual);
-    }
-
-    int best = (num > 0) ? list[0].rssi : -100;
-    ESP_LOGI(TAG, "扫描完成: %d 个AP, 最强 RSSI=%d dBm → 天线%s",
-             num, best, (best >= -80) ? "正常" : "偏弱 (检查硬件)");
-    free(list);
-}
+// 主动扫描周围 AP, 测试天线接收灵敏度 (暂时禁用)
+void WiFi::scanStart() { }
+void WiFi::scanLog()   { }
 
 /* ── WiFi 事件回调 (在事件任务上下文中执行) ── */
-
 void WiFi::_onWifiEvent(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     WiFi *self = (WiFi *)arg;
@@ -187,11 +149,27 @@ void WiFi::_onWifiEvent(void *arg, esp_event_base_t base, int32_t id, void *data
     case WIFI_EVENT_STA_DISCONNECTED: {
         wifi_event_sta_disconnected_t *evt = (wifi_event_sta_disconnected_t *)data;
         self->_connected = false;
+
+        /* 可读断开原因 */
+        struct { uint8_t r; const char *s, *hint; } reasons[] = {
+            {2,  "auth_expire",         "AP无响应 — 检查热点是否开放/信道是否正确"},
+            {15, "4way_handshake_timeout","密码错误 或 PMF不匹配"},
+            {200,"beacon_timeout",      "AP断线/信号丢失"},
+            {201,"no_ap_found",         "SSID不存在 或 大小写不匹配"},
+            {202,"auth_fail",           "安全模式不兼容 (WPA2 vs WPA3)"},
+            {204,"handshake_timeout",   "PMF配置问题"},
+            {205,"connection_fail",     "连接失败"},
+        };
+        const char *str = "?", *hint = "";
+        for (auto &rr : reasons) {
+            if (rr.r == evt->reason) { str = rr.s; hint = rr.hint; break; }
+        }
+        ESP_LOGW(TAG, "disconnected: %s (reason=%d) — %s", str, evt->reason, hint);
+
         if (self->_retry < WIFI_MAX_RETRY) {
             esp_wifi_connect();
             self->_retry++;
-            ESP_LOGW(TAG, "disconnected (reason=%d), retry %d/%d",
-                     evt->reason, self->_retry, WIFI_MAX_RETRY);
+            ESP_LOGW(TAG, "retry %d/%d", self->_retry, WIFI_MAX_RETRY);
         } else {
             ESP_LOGE(TAG, "max retries reached");
         }
