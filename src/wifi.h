@@ -11,7 +11,7 @@
  * ================================================================ */
 
 #define WIFI_SSID                   "JiaHe"
-#define WIFI_PASS                   "123456789"
+#define WIFI_PASS                   "12345678"
 #define WIFI_MAX_RETRY              5
 
 class WiFi {

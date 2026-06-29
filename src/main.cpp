@@ -233,6 +233,8 @@ static void core1_ctrl(void *pv)
     ESP_LOGI(TAG, "Core1 start");
 
     while (1) {
+        /* GPIO2 测试: 短接GND → 四轮90%正转 */
+        g_motor.testRun();
         decltype(Msg::imu) latest{};
         bool has_new = false;
         while (xQueueReceive(_sq, &msg, 0) == pdPASS) {

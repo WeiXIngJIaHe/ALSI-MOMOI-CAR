@@ -28,7 +28,7 @@
 
 /* ---- 按钮 ---- */
 #define BUZZER_PLAY_PIN             GPIO_NUM_2      /* 按一次 = 启动 */
-#define BUZZER_STOP_PIN             GPIO_NUM_3      /* 按下 = 停止 */
+#define BUZZER_STOP_PIN             GPIO_NUM_2    /* 按下 = 停止 */
 
 /* ---- 计时 (scan 周期 = 10ms) ---- */
 #define BUZZER_SCAN_MS              10
